@@ -1,3 +1,5 @@
+Diff change 2
+
 # <img src="logo.svg" alt="Uniswap Hooks" height="40px">
 
 [![Coverage Status](https://codecov.io/gh/OpenZeppelin/uniswap-hooks/graph/badge.svg)](https://codecov.io/gh/OpenZeppelin/uniswap-hooks)
