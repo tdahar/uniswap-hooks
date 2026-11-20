@@ -1,0 +1,134 @@
+= TWAP Orders
+
+Large orders executed in a single swap move the price of a pool against the trader, and expose them to sandwich attacks. Time-weighted average price (TWAP) orders split an order into equal parts that are sold over time, so that the trader gets a price close to the average price of the pool over the life of the order.
+
+The xref:api:general.adoc#TWAPOrderHook[`TWAPOrderHook`] implements TWAP orders as a Uniswap v4 hook, with the math in the xref:api:utils.adoc#TWAPMath[`TWAPMath`] library. Any pool initialized with the hook supports TWAP orders in both directions.
+
+== Epochs
+
+Time is divided into epochs of `epochLength` seconds, set when the hook is deployed. Epoch `e` covers the timestamps from `e * epochLength` to `(e + 1) * epochLength - 1`, so all pools of a hook share the same epochs.
+
+An order is identified by its owner, its direction (`zeroForOne`) and its expiry epoch. An order submitted during epoch `e` with expiry `x`:
+
+* sells `amountIn / (x - e)` per epoch, its _sell rate_, rounded down;
+* sells in epochs `e` to `x - 1`, both included;
+* has nothing left to sell once epoch `x` begins.
+
+Submitting an order with the same owner, direction and expiry as an existing order tops up the existing order: the new sell rate is added to it for the remaining epochs.
+
+[source,solidity]
+----
+// Sell 1,000 USDC for WETH over the next 24 epochs
+uint32 expiry = hook.currentEpoch() + 24;
+IERC20(usdc).approve(address(hook), 1_000e6);
+(bytes32 orderId, uint256 sellRate) = hook.submitOrder(key, zeroForOne, expiry, 1_000e6);
+----
+
+For pools with the native currency, the amount of native orders is sent as value.
+
+== Execution
+
+An epoch is executed once it is over. Executions happen:
+
+* in the `beforeSwap` hook, before the first swap in the pool after the epoch, so that swappers always trade against a pool where the orders have been executed;
+* when an order of the pool is submitted, cancelled or claimed;
+* when anyone calls `executeOrders`, which is useful for pools that are rarely swapped.
+
+The hook keeps, for each pool and direction, an _order pool_ with the sum of the sell rates of its active orders, and the sum of the sell rates that end at each epoch. Since sell rates only change when orders expire, the epochs between two expirations are executed as a single batch. Executing a pool after a long period without activity costs a storage read per idle epoch, and a batch per expiration.
+
+=== Matching
+
+Within a batch, the orders selling `currency0` and the orders selling `currency1` are first matched against each other at the current price of the pool, with xref:api:utils.adoc#TWAPMath-matchAmounts-uint256-uint256-uint160-[`matchAmounts`]:
+
+* if the `currency0` sold is worth more than the `currency1` sold, the orders selling `currency1` receive the equivalent amount of `currency0`, the orders selling `currency0` receive all the `currency1`, and the rest of the `currency0` is swapped through the pool;
+* otherwise, the same applies with the currencies reversed.
+
+Matched amounts never go through the pool, so they pay no swap fees and have no price impact. Only the excess (the unmatched part of one of the sides) is swapped, as an exact input swap. The hook settles the deltas of its swap with the `PoolManager` right away, using the xref:api:utils.adoc#CurrencySettler[`CurrencySettler`] library.
+
+=== Earnings
+
+The earnings of a side are shared among its orders pro rata to their sell rates. Instead of updating every order, each order pool keeps an _earnings factor_: the accumulated earnings per unit of sell rate, as a Q128.96 fixed point number. An order records the earnings factor when it is created, and its earnings at any point are:
+
+[source,text]
+----
+earnings = sellRate * (earningsFactorNow - earningsFactorLast) / 2^96
+----
+
+When orders expire at an epoch, the earnings factor at that epoch is stored, so that expired orders stop earning even if they are claimed much later. Earnings factors and earnings are rounded down, so the hook never owes more than it holds.
+
+== Claiming and cancelling
+
+Earnings are credited to the owner of an order, and are withdrawn separately:
+
+* `claimEarnings` credits the earnings of an order to its owner, and deletes the order if it has expired. It can be called by anyone, since the earnings always go to the owner.
+* `claimTokens` withdraws tokens credited to the caller, all of them when the amount is zero.
+
+An order that has not expired can be cancelled with `cancelOrder`. Its earnings are credited to its owner, and the part not sold yet, including the current epoch (which has not been executed), is refunded to the recipient chosen by the caller. Once the expiry epoch of an order is reached, it has sold everything and can only be claimed.
+
+Owners can approve operators with `setOperator`, for example a vault or a keeper that manages orders on their behalf. An approved operator can cancel the orders of the owner and choose the recipient of the refund, so operators must be trusted with the unsold amount of the orders. Operators cannot submit orders on behalf of an owner, nor withdraw the tokens credited to it.
+
+== Protocol fee
+
+The owner of the hook can set a protocol fee of up to 10% (`MAX_PROTOCOL_FEE`, in basis points) with `setProtocolFee`. The fee is taken from the earnings of each execution before they are distributed to the orders, and accrues per currency until the owner collects it with `collectProtocolFees`. The fee only applies to executions after it is set.
+
+== Security considerations
+
+=== Price
+
+Orders are executed at the price of the pool at the time of execution, both for matching and for the swap of the excess, without a price limit. The hook does not protect orders against a manipulated price: an attacker who controls the last block of an epoch could move the price before an execution and move it back after it. The risk is reduced by the small size of each part of an order, but it should be taken into account when choosing the epoch length and the pools where the hook is used. Pools with deep liquidity and frequent swaps are better suited for TWAP orders.
+
+If the pool cannot fill the whole excess of an execution, for example because it has no liquidity, the unfilled part is not refunded to the orders. TWAP orders are meant for pools with enough liquidity for the amounts sold per epoch.
+
+=== Epoch length
+
+Short epochs give a better average price, but make executions after idle periods more expensive, since the hook visits every idle epoch. The first swap after a long idle period pays for the execution. Deployers should choose an epoch length that keeps the number of epochs between two swaps small, for example one hour for active pools.
+
+=== Tokens
+
+The hook keeps the tokens of all its pools in a single balance per currency, so tokens with non-standard behavior can affect other pools that use the same currency. The hook does not support:
+
+* tokens that charge a fee on transfer, or whose balances change without transfers (rebasing tokens);
+* tokens with callbacks to the sender or the recipient of transfers, such as ERC-777 tokens.
+
+=== Swaps of the hook
+
+The swaps of the hook do not call the hooks of the pool, since the `PoolManager` does not call a hook on its own actions. Other hooks cannot be combined with the TWAP order hook in the same pool, given that a pool has a single hook. To add TWAP orders to a pool with other custom behavior, inherit from the hook and override its functions, keeping the call to `_executeOrders` in `_beforeSwap`.
+
+== Example
+
+[source,solidity]
+----
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {TWAPOrderHook} from "src/general/TWAPOrderHook.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @dev Sells a treasury position over a week through a pool with the TWAP order hook.
+ */
+contract TreasuryDiversifier {
+    TWAPOrderHook public immutable hook;
+
+    constructor(TWAPOrderHook _hook) {
+        hook = _hook;
+    }
+
+    function sellOverAWeek(PoolKey calldata key, bool zeroForOne, uint256 amount) external returns (bytes32) {
+        Currency sold = zeroForOne ? key.currency0 : key.currency1;
+        IERC20(Currency.unwrap(sold)).approve(address(hook), amount);
+
+        uint32 expiry = hook.currentEpoch() + uint32(7 days / hook.epochLength());
+        (bytes32 orderId,) = hook.submitOrder(key, zeroForOne, expiry, amount);
+        return orderId;
+    }
+
+    function withdraw(PoolKey calldata key, TWAPOrderHook.OrderKey calldata orderKey, address to) external {
+        hook.claimEarnings(key, orderKey);
+        Currency bought = orderKey.zeroForOne ? key.currency1 : key.currency0;
+        hook.claimTokens(bought, to, 0);
+    }
+}
+----

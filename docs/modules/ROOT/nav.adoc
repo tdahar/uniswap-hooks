@@ -2,3 +2,4 @@
 * xref:base.adoc[Base]
 * xref:fee.adoc[Fee]
 * xref:utilities.adoc[Utilities]
+* xref:twap-orders.adoc[TWAP Orders]
